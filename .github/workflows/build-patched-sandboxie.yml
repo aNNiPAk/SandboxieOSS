@@ -111,21 +111,71 @@ jobs:
         working-directory: Sandboxie
         run: Installer\get_assets.cmd
 
-      - name: Upload installer assets
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: Assets_patched_${{ inputs.upstream_ref }}
-          path: |
-            Sandboxie/Installer/Assets/*
-          if-no-files-found: error
-          retention-days: 30
+      - name: Prepare installer package
+        shell: pwsh
+        run: |
+          $installerDir = Join-Path $env:GITHUB_WORKSPACE "Sandboxie\Installer"
+          $sourceDir = Join-Path $installerDir "SbiePlus_x64"
+          $releaseDir = Join-Path $installerDir "Release"
+          $packageDir = Join-Path $releaseDir "SbiePlus64"
 
-      - name: Upload Sandboxie x64
+          if (-not (Test-Path $sourceDir)) {
+            throw "Expected build output directory was not created: $sourceDir"
+          }
+
+          New-Item -ItemType Directory -Force $releaseDir | Out-Null
+          if (Test-Path $packageDir) {
+            Remove-Item -Recurse -Force $packageDir
+          }
+
+          robocopy $sourceDir $packageDir /E
+          if ($LASTEXITCODE -gt 7) {
+            exit $LASTEXITCODE
+          }
+
+          $versionHeader = Get-Content (Join-Path $env:GITHUB_WORKSPACE "Sandboxie\Sandboxie\common\my_version.h")
+          $versionMajor = [int](($versionHeader | Select-String '^\s*#define\s+VERSION_MJR\s+(\d+)').Matches[0].Groups[1].Value)
+          $versionMinor = [int](($versionHeader | Select-String '^\s*#define\s+VERSION_MIN\s+(\d+)').Matches[0].Groups[1].Value)
+          $versionRevision = [int](($versionHeader | Select-String '^\s*#define\s+VERSION_REV\s+(\d+)').Matches[0].Groups[1].Value)
+          $versionUpdate = [int](($versionHeader | Select-String '^\s*#define\s+VERSION_UPD\s+(\d+)').Matches[0].Groups[1].Value)
+
+          $plusMajor = $versionMajor - 4
+          $plusMinor = $versionMinor - 55
+          if ($versionUpdate -gt 0) {
+            $plusVersion = "$plusMajor.$plusMinor.$versionRevision.$versionUpdate"
+          } else {
+            $plusVersion = "$plusMajor.$plusMinor.$versionRevision"
+          }
+
+          "SBIE_PLUS_VERSION=$plusVersion" >> $env:GITHUB_ENV
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build Sandboxie Plus installer
+        working-directory: Sandboxie\Installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup Compiler was not found: $iscc"
+          }
+
+          $ciScript = "Sandboxie-Plus-CI.iss"
+          $scriptText = Get-Content "Sandboxie-Plus.iss" -Raw
+          $scriptText = $scriptText -replace '(?m)^SignTool=sha256\r?\n', ''
+          $scriptText = $scriptText -replace '(?ms)^; ImDiskTK\r?\n#if MyAppArch == "x64".*?#endif\r?\n', ''
+          $scriptText = $scriptText -replace '(?ms)^; Install ImDisk 3\.0 driver\r?\n#if MyAppArch == "x64".*?#endif\r?\n', ''
+          Set-Content -Path $ciScript -Value $scriptText -Encoding utf8
+
+          & $iscc /ORelease $ciScript /DMyAppVersion="$env:SBIE_PLUS_VERSION" /DMyAppArch=x64 /DMyAppSrc=SbiePlus64
+
+      - name: Upload Sandboxie Plus installer
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: Sandboxie_x64_patched_${{ inputs.upstream_ref }}
+          name: Sandboxie_Plus_x64_patched_${{ inputs.upstream_ref }}
           path: |
-            Sandboxie/Installer/SbiePlus_x64/*
+            Sandboxie/Installer/Release/Sandboxie-Plus-x64-v*.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -140,10 +190,8 @@ jobs:
             $tag = "patched-${{ inputs.upstream_ref }}"
           }
 
-          $artifactFiles = @(
-            Get-ChildItem "Sandboxie\Installer\SbiePlus_x64" -File -Recurse
-            Get-ChildItem "Sandboxie\Installer\Assets" -File -Recurse -ErrorAction SilentlyContinue
-          ) | Select-Object -ExpandProperty FullName
+          $artifactFiles = @(Get-ChildItem "Sandboxie\Installer\Release\Sandboxie-Plus-x64-v*.exe" -File) |
+            Select-Object -ExpandProperty FullName
 
           if ($artifactFiles.Count -eq 0) {
             throw "No artifact files found for release upload."
