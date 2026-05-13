@@ -45,7 +45,8 @@ jobs:
         run: |
           cd Sandboxie
           git apply --check ..\builder\patches\verify.patch
-          git apply --3way ..\builder\patches\verify.patch
+          git apply ..\builder\patches\verify.patch
+          git diff --check
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
@@ -90,23 +91,42 @@ jobs:
         working-directory: Sandboxie
         run: msbuild /t:build SandboxieTools\SandboxieTools.sln /p:Configuration="Release" /p:Platform=x64 -maxcpucount:8
 
-      - name: Merge build
+      - name: Add missing languages for Qt6
         working-directory: Sandboxie
-        shell: cmd
-        run: |
-          Installer\fix_qt5_languages.cmd x64 build_qt6
-          Installer\get_openssl.cmd
-          Installer\get_7zip.cmd
-          Installer\copy_build.cmd x64 build_qt6
-          Installer\get_assets.cmd
+        run: Installer\fix_qt5_languages.cmd x64 build_qt6
 
-      - name: Upload artifact
+      - name: Get openssl binaries
+        working-directory: Sandboxie
+        run: Installer\get_openssl.cmd
+
+      - name: Get 7z binaries
+        working-directory: Sandboxie
+        run: Installer\get_7zip.cmd
+
+      - name: Merging Build
+        working-directory: Sandboxie
+        run: Installer\copy_build.cmd x64 build_qt6
+
+      - name: Collect installer assets
+        working-directory: Sandboxie
+        run: Installer\get_assets.cmd
+
+      - name: Upload installer assets
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Assets_patched_${{ inputs.upstream_ref }}
+          path: |
+            Sandboxie/Installer/Assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Sandboxie x64
         uses: actions/upload-artifact@v7.0.1
         with:
           name: Sandboxie_x64_patched_${{ inputs.upstream_ref }}
           path: |
             Sandboxie/Installer/SbiePlus_x64/*
-            Sandboxie/Installer/Assets/*
+          if-no-files-found: error
           retention-days: 30
 
       - name: Create GitHub Release
@@ -120,10 +140,19 @@ jobs:
             $tag = "patched-${{ inputs.upstream_ref }}"
           }
 
+          $artifactFiles = @(
+            Get-ChildItem "Sandboxie\Installer\SbiePlus_x64" -File -Recurse
+            Get-ChildItem "Sandboxie\Installer\Assets" -File -Recurse -ErrorAction SilentlyContinue
+          ) | Select-Object -ExpandProperty FullName
+
+          if ($artifactFiles.Count -eq 0) {
+            throw "No artifact files found for release upload."
+          }
+
           if (gh release view $tag 2>$null) {
-            gh release upload $tag Sandboxie/Installer/SbiePlus_x64/* Sandboxie/Installer/Assets/* --clobber
+            gh release upload $tag @artifactFiles --clobber
           } else {
-            gh release create $tag Sandboxie/Installer/SbiePlus_x64/* Sandboxie/Installer/Assets/* `
+            gh release create $tag @artifactFiles `
               --title "Patched Sandboxie ${{ inputs.upstream_ref }}" `
               --notes "Patched build from sandboxie-plus/Sandboxie ref ${{ inputs.upstream_ref }}."
           }
