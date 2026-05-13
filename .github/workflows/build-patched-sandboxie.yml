@@ -1,0 +1,129 @@
+name: Build patched Sandboxie
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Sandboxie tag/branch/SHA"
+        required: true
+        default: "master"
+        type: string
+      make_release:
+        description: "Create release in this repository"
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: "Local release tag, e.g. patched-v1.15.13"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-x64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout my repository
+        uses: actions/checkout@v6
+        with:
+          path: builder
+
+      - name: Checkout upstream Sandboxie
+        uses: actions/checkout@v6
+        with:
+          repository: sandboxie-plus/Sandboxie
+          ref: ${{ inputs.upstream_ref }}
+          path: Sandboxie
+          fetch-depth: 0
+
+      - name: Apply patch
+        shell: pwsh
+        run: |
+          cd Sandboxie
+          git apply --check ..\builder\patches\verify.patch
+          git apply --3way ..\builder\patches\verify.patch
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Load build variables
+        shell: cmd
+        working-directory: Sandboxie
+        run: |
+          call Installer\buildVariables.cmd build_qt6
+          echo qt6_version=%qt6_version%>>%GITHUB_ENV%
+          echo qt_version=%qt6_version%>>%GITHUB_ENV%
+
+      - name: Build Sandboxie x86 DLLs and service
+        working-directory: Sandboxie
+        run: msbuild /t:build Sandboxie\SandboxDll.sln /p:Configuration="SbieRelease" /p:Platform=Win32 -maxcpucount:8
+
+      - name: Build Sandboxie x64 core
+        working-directory: Sandboxie
+        run: msbuild /t:build Sandboxie\Sandbox.sln /p:Configuration="SbieRelease" /p:Platform=x64 -maxcpucount:8
+
+      - name: Build Sandboxie x64 driver
+        working-directory: Sandboxie
+        run: msbuild /t:build Sandboxie\SandboxDrv.sln /p:Configuration="SbieRelease" /p:Platform=x64 -maxcpucount:8
+
+      - name: Install Qt6 x64
+        working-directory: Sandboxie
+        run: SandboxiePlus\install_qt.cmd x64
+
+      - name: Install Jom
+        working-directory: Sandboxie
+        run: SandboxiePlus\install_jom.cmd
+
+      - name: Build Sandboxie Plus x64
+        working-directory: Sandboxie
+        run: SandboxiePlus\qmake_plus.cmd x64 build_qt6
+
+      - name: Build SbieShell x64
+        working-directory: Sandboxie
+        run: msbuild /t:restore,build -p:RestorePackagesConfig=true SandboxiePlus\SbieShell\SbieShell.sln /p:Configuration="Release" /p:Platform=x64
+
+      - name: Build Sandboxie Tools x64
+        working-directory: Sandboxie
+        run: msbuild /t:build SandboxieTools\SandboxieTools.sln /p:Configuration="Release" /p:Platform=x64 -maxcpucount:8
+
+      - name: Merge build
+        working-directory: Sandboxie
+        shell: cmd
+        run: |
+          Installer\fix_qt5_languages.cmd x64 build_qt6
+          Installer\get_openssl.cmd
+          Installer\get_7zip.cmd
+          Installer\copy_build.cmd x64 build_qt6
+          Installer\get_assets.cmd
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Sandboxie_x64_patched_${{ inputs.upstream_ref }}
+          path: |
+            Sandboxie/Installer/SbiePlus_x64/*
+            Sandboxie/Installer/Assets/*
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: ${{ inputs.make_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ inputs.release_tag }}"
+          if (-not $tag) {
+            $tag = "patched-${{ inputs.upstream_ref }}"
+          }
+
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag Sandboxie/Installer/SbiePlus_x64/* Sandboxie/Installer/Assets/* --clobber
+          } else {
+            gh release create $tag Sandboxie/Installer/SbiePlus_x64/* Sandboxie/Installer/Assets/* `
+              --title "Patched Sandboxie ${{ inputs.upstream_ref }}" `
+              --notes "Patched build from sandboxie-plus/Sandboxie ref ${{ inputs.upstream_ref }}."
+          }
